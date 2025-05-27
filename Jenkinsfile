@@ -3,9 +3,10 @@ pipeline {
 
     environment {
         NODE_VERSION = '16.x'
-        REGISTRY_URL = 'https://registry.hub.docker.com'
-        DOCKER_CREDENTIALS = credentials('docker-hub-credentials')
+        GITHUB_REPO_URL = 'https://github.com/zim0101/node-hello-world'
         APP_NAME = 'node-hello-world'
+        DEPLOY_SERVER = 'user@vm-server-ip'
+        APP_PATH = '/opt/node-apps/node-hello-world'
     }
 
     parameters {
@@ -23,16 +24,10 @@ pipeline {
         stage('Checkout') {
             steps {
                 git branch: "${params.BRANCH}", 
-                    url: 'https://github.com/zim0101/node-hello-world.git'
-            }
-        }
-
-        stage('Setup Node') {
-            steps {
-                nodejs(nodeJSInstallationName: 'Node 16') {
-                    sh 'node --version'
-                    sh 'npm --version'
-                }
+                    url: "${GITHUB_REPO_URL}"
+                
+                sh 'node --version'
+                sh 'npm --version'
             }
         }
 
@@ -48,45 +43,65 @@ pipeline {
             }
         }
 
-        stage('Test') {
+        stage('Unit Tests') {
             steps {
                 sh 'npm test'
-                junit 'coverage/junit.xml'
             }
             post {
                 always {
+                    junit 'coverage/junit.xml'
                     jacoco execPattern: 'coverage/jacoco.exec'
                 }
             }
         }
 
-        stage('Build Docker Image') {
+        stage('Build') {
             steps {
-                script {
-                    docker.build("${APP_NAME}:${env.BUILD_NUMBER}")
-                }
+                sh 'npm run build'
             }
         }
 
-        stage('Push to Registry') {
-            when { branch 'master' }
+        stage('Security Scan') {
             steps {
-                script {
-                    docker.withRegistry(REGISTRY_URL, DOCKER_CREDENTIALS) {
-                        docker.image("${APP_NAME}:${env.BUILD_NUMBER}").push()
-                    }
-                }
+                sh 'npm audit'
             }
         }
 
         stage('Deploy') {
-            when { expression { params.DEPLOY_ENV == 'production' } }
+            when {
+                branch 'master'
+            }
             steps {
                 script {
-                    // Example deployment step
+                    // Prepare deployment based on environment
+                    def deployConfig = [
+                        'dev': [port: 3000],
+                        'staging': [port: 3001],
+                        'production': [port: 3002]
+                    ][params.DEPLOY_ENV]
+
+                    // Stop existing application if running
                     sh """
-                        kubectl set image deployment/${APP_NAME} \
-                        ${APP_NAME}=${APP_NAME}:${env.BUILD_NUMBER}
+                        ssh ${DEPLOY_SERVER} "
+                            if pm2 list | grep ${APP_NAME}-${params.DEPLOY_ENV}; then
+                                pm2 delete ${APP_NAME}-${params.DEPLOY_ENV}
+                            fi
+                        "
+                    """
+
+                    // Copy files to server
+                    sh """
+                        ssh ${DEPLOY_SERVER} "mkdir -p ${APP_PATH}"
+                        scp -r . ${DEPLOY_SERVER}:${APP_PATH}
+                    """
+
+                    // Install dependencies and start application
+                    sh """
+                        ssh ${DEPLOY_SERVER} "
+                            cd ${APP_PATH} &&
+                            npm ci &&
+                            PM2_HOME=/home/user/.pm2 pm2 start npm --name ${APP_NAME}-${params.DEPLOY_ENV} -- start -- --port ${deployConfig.port}
+                        "
                     """
                 }
             }
@@ -96,21 +111,16 @@ pipeline {
     post {
         success {
             echo 'Pipeline completed successfully!'
-            slackSend(
-                color: 'good', 
-                message: "Build ${env.BUILD_NUMBER} succeeded for ${APP_NAME}"
-            )
+            slackSend color: 'good', 
+                      message: "Build ${env.BUILD_NUMBER} succeeded for ${APP_NAME}"
         }
         failure {
             echo 'Pipeline failed!'
-            slackSend(
-                color: 'danger', 
-                message: "Build ${env.BUILD_NUMBER} failed for ${APP_NAME}"
-            )
+            slackSend color: 'danger', 
+                      message: "Build ${env.BUILD_NUMBER} failed for ${APP_NAME}"
         }
         always {
             cleanWs()
-            deleteDir()
         }
     }
 }
